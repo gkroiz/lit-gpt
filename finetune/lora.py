@@ -84,6 +84,7 @@ def setup(
 
 
 def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path):
+    print('in main')
     fabric.print(hparams)
     check_valid_checkpoint_dir(checkpoint_dir)
 
@@ -96,7 +97,7 @@ def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path):
 
     train_data = torch.load(data_dir / "train.pt")
     val_data = torch.load(data_dir / "test.pt")
-
+    fabric.print('after loading train and val')
     if not any((lora_query, lora_key, lora_value, lora_projection, lora_mlp, lora_head)):
         fabric.print("Warning: all LoRA layers are disabled!")
     config = Config.from_name(
@@ -116,6 +117,8 @@ def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path):
     with fabric.init_module(empty_init=False):
         model = GPT(config)
         model.apply(model._init_weights)  # for the LoRA weights
+    print('after init_module')
+    exit()
     with lazy_load(checkpoint_path) as checkpoint:
         # strict=False because missing keys due to LoRA weights not contained in state dict
         model.load_state_dict(checkpoint, strict=False)
