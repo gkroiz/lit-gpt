@@ -6,7 +6,7 @@ from typing import Optional, List, Dict, Tuple
 
 import lightning as L
 import torch
-from lightning.fabric.strategies import XLAStrategy, FSDPStrategy
+from lightning.fabric.strategies import XLAFSDPStrategy, FSDPStrategy
 
 # support running without installing as a package
 wd = Path(__file__).parent.parent.resolve()
@@ -24,17 +24,17 @@ eval_interval = 100
 save_interval = 100
 eval_iters = 100
 log_interval = 1
-devices = 1
+devices = 4
 # change this value to force a maximum sequence length
 override_max_seq_length = None
 
 # Hyperparameters
 learning_rate = 3e-4
-batch_size = 128
-micro_batch_size = 4
+batch_size = 1
+micro_batch_size = 1
 gradient_accumulation_iters = batch_size // micro_batch_size
 assert gradient_accumulation_iters > 0
-max_iters = 50000  # train dataset size
+max_iters = 500  # train dataset size
 weight_decay = 0.01
 lora_r = 8
 lora_alpha = 16
@@ -64,7 +64,9 @@ def setup(
         if tpu:
             # For multi-host TPU training, the device count for Fabric is limited to the count on a single host.
             fabric_devices = "auto"
-            strategy = XLAStrategy(sync_module_states=False)
+            from torch_xla.distributed.fsdp.wrap import always_wrap_policy
+
+            strategy = XLAFSDPStrategy(auto_wrap_policy=always_wrap_policy, sync_module_states=False)
         else:
             precision="bf16-true"
             strategy=FSDPStrategy(
@@ -127,7 +129,8 @@ def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path):
     fabric.print(f"Number of non trainable parameters: {num_params:,}")
 
     optimizer = torch.optim.AdamW(trainable_params, lr=learning_rate, weight_decay=weight_decay)
-    model, optimizer = fabric.setup(model, optimizer)
+    model = fabric.setup_module(model)
+    optimizer = fabric.setup_optimizers(optimizer)
 
     fabric.seed_everything(1337 + fabric.global_rank)
 
