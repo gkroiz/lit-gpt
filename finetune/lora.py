@@ -61,6 +61,10 @@ def setup(
     tpu: bool = False,
     check_model_init: bool=False
 ):
+    # for torch cpu dist
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = "29501"
+
     if precision is None:
         precision = "32-true" if tpu else "bf16-mixed"
     fabric_devices = devices
@@ -88,10 +92,18 @@ def setup(
 
 
 def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path, check_model_init: bool):
+    fabric.print('----------in main--------------')
+    # setup torch distributed group for cpu    
+    import torch.distributed as dist
+
+    dist.init_process_group("gloo", rank=fabric.global_rank, world_size=fabric.world_size)
+
+    fabric.print('----------after cpu dist init--------------')
+
     if fabric.device.type == 'xla':
         from torch_xla.distributed.fsdp.xla_fully_sharded_data_parallel import XlaFullyShardedDataParallel
         import torch_xla.core.xla_model as xm
-    fabric.print('----------in main--------------')
+
     fabric.print(hparams)
     check_valid_checkpoint_dir(checkpoint_dir)
 
@@ -135,7 +147,7 @@ def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path, 
 
     # replace lm_head
     fabric.print('replace lm_head')
-    with fabric.device:
+    with torch.device("cpu"):
         if config.to_head:
             lm_head_on_device = LoRALinear(
                 model.config.n_embd,
@@ -149,45 +161,41 @@ def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path, 
             lm_head_on_device = nn.Linear(model.config.n_embd, config.padded_vocab_size, bias=False)
     for param_name, _ in model.lm_head.named_parameters():
         key = f"lm_head.{param_name}"
-        if fabric.global_rank == 0:
-            keys = lm_head_on_device.load_state_dict({param_name: state_dict[key]}, strict=False)
-            assert not keys.unexpected_keys
-        fabric.barrier('load_ckpt_weights')
-    xm.broadcast_master_param(lm_head_on_device)
+        to_broadcast = state_dict[key] if fabric.global_rank == 0 else {}
+        to_load = broadcast(to_broadcast, src=0)
+        keys = lm_head_on_device.load_state_dict({param_name: to_load}, strict=False)
+        assert not keys.unexpected_keys
     model.lm_head = lm_head_on_device
-    
     # replace wte
     fabric.print('replace transformer.wte')
-    with fabric.device:
+    with torch.device("cpu"):
             wte_on_device = nn.Embedding(model.config.padded_vocab_size, model.config.n_embd)
     for param_name, _ in model.transformer.wte.named_parameters():
         key = f"transformer.wte.{param_name}"
-        if fabric.global_rank == 0:
-            keys = wte_on_device.load_state_dict({param_name: state_dict[key]}, strict=False)
-            assert not keys.unexpected_keys
-        fabric.barrier('load_ckpt_weights')
-    xm.broadcast_master_param(wte_on_device)
+        to_broadcast = state_dict[key] if fabric.global_rank == 0 else {}
+        to_load = broadcast(to_broadcast, src=0)
+        keys = wte_on_device.load_state_dict({param_name: to_load}, strict=False)
+        assert not keys.unexpected_keys
     model.transformer.wte = wte_on_device
 
     # replace ln_f
     fabric.print('replace transformer.ln_f')
-    with fabric.device:
+    with torch.device("cpu"):
         ln_f_on_device = model.config.norm_class(model.config.n_embd, eps=model.config.norm_eps)
     key = 'transformer.ln_f.weight'
     for param_name, _ in model.transformer.ln_f.named_parameters():
         key = f"transformer.ln_f.{param_name}"
-        if fabric.global_rank == 0:
-            keys = ln_f_on_device.load_state_dict({param_name: state_dict[key]}, strict=False)
-        fabric.barrier('load_ckpt_weights')
-    xm.broadcast_master_param(ln_f_on_device)
+        to_broadcast = state_dict[key] if fabric.global_rank == 0 else {}
+        to_load = broadcast(to_broadcast, src=0)
+        keys = ln_f_on_device.load_state_dict({param_name: to_load}, strict=False)
     model.transformer.ln_f = ln_f_on_device
 
 
     # replace all blocks
-    fabric.print('release transformer.h[i] for i in num_layers')
     for i, block in enumerate(model.transformer.h):
+        fabric.print(f'replace transformer.h[{i}].')
         lora_params = {}
-        with fabric.device:
+        with torch.device("cpu"):
             block_on_device = Block(model.config)
             block_on_device.apply(model._init_weights)
         for param_name, param in block_on_device.named_parameters():
@@ -195,11 +203,9 @@ def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path, 
             if lora_filter(key, None):
                 lora_params[param_name] = param
             else:
-                if fabric.global_rank == 0:
-                    keys = block_on_device.load_state_dict({param_name: state_dict[key]}, strict=False)
-                    assert not keys.unexpected_keys
-        fabric.barrier('load_ckpt_weights')
-        xm.broadcast_master_param(block_on_device)
+                to_broadcast = state_dict[key] if fabric.global_rank == 0 else {}
+                to_load = broadcast(to_broadcast, src=0)
+                keys = block_on_device.load_state_dict({param_name: to_load}, strict=False)
         for param_name, param in zip(lora_params.keys(), lora_params.values()):
             submodule = block_on_device
             for sub_name in param_name.split('.'):
@@ -217,7 +223,7 @@ def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path, 
                 setattr(submodule, param_name, torch.nn.Parameter(state_dict_param))
 
     fabric.print(f'Memory usage after all model init (before root fsdp sharding): {(psutil.virtual_memory()[3]/1e9):.02f} GB')
-    model = XlaFullyShardedDataParallel(model)
+    model = fabric.setup(model)
     fabric.print(f'Memory usage after all model init (after root fsdp sharding) {(psutil.virtual_memory()[3]/1e9):.02f} GB')
 
     print('model.lm_head.weight.device: ' + str(model.lm_head.weight.device))
@@ -368,6 +374,9 @@ def validate(
     for k in range(eval_iters):
         input_ids, targets = get_batch(fabric, val_data, longest_seq_length)
         logits = model(input_ids)
+        import torch_xla.core.xla_model as xm
+
+        xm.mark_step()
         loss = chunked_cross_entropy(logits, targets, chunk_size=0)
         losses[k] = loss.item()
     val_loss = losses.mean()
@@ -441,6 +450,7 @@ def save_lora_checkpoint(fabric, model, file_path: Path):
 def broadcast(obj: TBroadcast, src: int = 0) -> TBroadcast:
     if not torch.distributed.is_initialized():
         return obj
+    from lightning.fabric.utilities.distributed import group as _group
 
     obj = [obj]
     torch.distributed.broadcast_object_list(obj, src, group=_group.WORLD)
