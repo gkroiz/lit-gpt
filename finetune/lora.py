@@ -22,6 +22,7 @@ from lit_gpt.utils import lazy_load, check_valid_checkpoint_dir, step_csv_logger
 from lit_gpt.speed_monitor import SpeedMonitorFabric as SpeedMonitor, measure_flops, estimate_flops
 from scripts.prepare_alpaca import generate_prompt
 
+from lightning.fabric.utilities.distributed import group as _group
 
 eval_interval = 100
 save_interval = 100
@@ -62,8 +63,8 @@ def setup(
     check_model_init: bool=False
 ):
     # for torch cpu dist
-    os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = "29501"
+    # os.environ["MASTER_ADDR"] = "localhost"
+    # os.environ["MASTER_PORT"] = "29501"
 
     if precision is None:
         precision = "32-true" if tpu else "bf16-mixed"
@@ -93,10 +94,11 @@ def setup(
 
 def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path, check_model_init: bool):
     fabric.print('----------in main--------------')
-    # setup torch distributed group for cpu    
-    import torch.distributed as dist
 
-    dist.init_process_group("gloo", rank=fabric.global_rank, world_size=fabric.world_size)
+    # setup torch distributed group for cpu    
+    # import torch.distributed as dist
+
+    # dist.init_process_group("gloo", rank=fabric.global_rank, world_size=fabric.world_size)
 
     fabric.print('----------after cpu dist init--------------')
 
@@ -133,100 +135,105 @@ def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path, 
     )
     checkpoint_path = checkpoint_dir / "lit_model.pth"
     fabric.print(f"Loading model {str(checkpoint_path)!r} with {config.__dict__}")
-    with torch.device("meta"):
-        model = GPT(config)
-    expected = sum(p.numel() for p in model.parameters()) * 4 / 1e9
-    fabric.print(f'expected ram usage to load full model on one ranks: {(expected):.02f} GB')
-    fabric.print(f'expected ram usage to load full model on all ranks: {(expected*fabric.world_size):.02f} GB')
+    # with torch.device("meta"):
+    #     model = GPT(config)
+    # expected = sum(p.numel() for p in model.parameters()) * 4 / 1e9
+    # fabric.print(f'expected ram usage to load full model on one ranks: {(expected):.02f} GB')
+    # fabric.print(f'expected ram usage to load full model on all ranks: {(expected*fabric.world_size):.02f} GB')
 
     fabric.print('----------model init--------------')
     fabric.print(f'Memory usage before model init sequential: {(psutil.virtual_memory()[3]/1e9):.02f} GB')
-    if fabric.global_rank == 0:
-        state_dict = torch.load(checkpoint_path)
+    # if fabric.global_rank == 0:
+        # state_dict = torch.load(checkpoint_path)
     fabric.print(f'Memory usage after loading checkpoint onto master rank: {(psutil.virtual_memory()[3]/1e9):.02f} GB')
 
-    # replace lm_head
-    fabric.print('replace lm_head')
-    with torch.device("cpu"):
-        if config.to_head:
-            lm_head_on_device = LoRALinear(
-                model.config.n_embd,
-                model.config.padded_vocab_size,
-                bias=False,
-                r=model.config.r,
-                lora_alpha=model.config.alpha,
-                lora_dropout=model.config.dropout,
-            )
-        else:
-            lm_head_on_device = nn.Linear(model.config.n_embd, config.padded_vocab_size, bias=False)
-    for param_name, _ in model.lm_head.named_parameters():
-        key = f"lm_head.{param_name}"
-        to_broadcast = state_dict[key] if fabric.global_rank == 0 else {}
-        to_load = broadcast(to_broadcast, src=0)
-        keys = lm_head_on_device.load_state_dict({param_name: to_load}, strict=False)
-        assert not keys.unexpected_keys
-    model.lm_head = lm_head_on_device
-    # replace wte
-    fabric.print('replace transformer.wte')
-    with torch.device("cpu"):
-            wte_on_device = nn.Embedding(model.config.padded_vocab_size, model.config.n_embd)
-    for param_name, _ in model.transformer.wte.named_parameters():
-        key = f"transformer.wte.{param_name}"
-        to_broadcast = state_dict[key] if fabric.global_rank == 0 else {}
-        to_load = broadcast(to_broadcast, src=0)
-        keys = wte_on_device.load_state_dict({param_name: to_load}, strict=False)
-        assert not keys.unexpected_keys
-    model.transformer.wte = wte_on_device
+    # with torch.device("meta"):
+        # model = GPT(config)
 
-    # replace ln_f
-    fabric.print('replace transformer.ln_f')
-    with torch.device("cpu"):
-        ln_f_on_device = model.config.norm_class(model.config.n_embd, eps=model.config.norm_eps)
-    key = 'transformer.ln_f.weight'
-    for param_name, _ in model.transformer.ln_f.named_parameters():
-        key = f"transformer.ln_f.{param_name}"
-        to_broadcast = state_dict[key] if fabric.global_rank == 0 else {}
-        to_load = broadcast(to_broadcast, src=0)
-        keys = ln_f_on_device.load_state_dict({param_name: to_load}, strict=False)
-    model.transformer.ln_f = ln_f_on_device
+    model = None
+    for rank in range(fabric.world_size):
+        fabric.print(f'----------model init on rank {rank}--------------')
+        if rank == fabric.global_rank:
+            with torch.device("meta"):
+                model = GPT(config)
+            state_dict = torch.load(checkpoint_path)
+
+            # replace lm_head
+            print('replace lm_head')
+            with torch.device("cpu"):
+                if config.to_head:
+                    lm_head_on_device = LoRALinear(
+                        model.config.n_embd,
+                        model.config.padded_vocab_size,
+                        bias=False,
+                        r=model.config.r,
+                        lora_alpha=model.config.alpha,
+                        lora_dropout=model.config.dropout,
+                    )
+                else:
+                    lm_head_on_device = nn.Linear(model.config.n_embd, config.padded_vocab_size, bias=False)
+            for param_name, _ in model.lm_head.named_parameters():
+                key = f"lm_head.{param_name}"
+                keys = lm_head_on_device.load_state_dict({param_name: state_dict[key]}, strict=False)
+                assert not keys.unexpected_keys
+            model.lm_head = lm_head_on_device
+            # replace wte
+            print('replace transformer.wte')
+            with torch.device("cpu"):
+                    wte_on_device = nn.Embedding(model.config.padded_vocab_size, model.config.n_embd)
+            for param_name, _ in model.transformer.wte.named_parameters():
+                key = f"transformer.wte.{param_name}"
+                keys = wte_on_device.load_state_dict({param_name: state_dict[key]}, strict=False)
+                assert not keys.unexpected_keys
+            model.transformer.wte = wte_on_device
+
+            # replace ln_f
+            print('replace transformer.ln_f')
+            with torch.device("cpu"):
+                ln_f_on_device = model.config.norm_class(model.config.n_embd, eps=model.config.norm_eps)
+            key = 'transformer.ln_f.weight'
+            for param_name, _ in model.transformer.ln_f.named_parameters():
+                key = f"transformer.ln_f.{param_name}"
+                keys = ln_f_on_device.load_state_dict({param_name: state_dict[key]}, strict=False)
+            model.transformer.ln_f = ln_f_on_device
 
 
-    # replace all blocks
-    for i, block in enumerate(model.transformer.h):
-        fabric.print(f'replace transformer.h[{i}].')
-        lora_params = {}
-        with torch.device("cpu"):
-            block_on_device = Block(model.config)
-            block_on_device.apply(model._init_weights)
-        for param_name, param in block_on_device.named_parameters():
-            key = f"transformer.h.{i}.{param_name}"
-            if lora_filter(key, None):
-                lora_params[param_name] = param
-            else:
-                to_broadcast = state_dict[key] if fabric.global_rank == 0 else {}
-                to_load = broadcast(to_broadcast, src=0)
-                keys = block_on_device.load_state_dict({param_name: to_load}, strict=False)
-        for param_name, param in zip(lora_params.keys(), lora_params.values()):
-            submodule = block_on_device
-            for sub_name in param_name.split('.'):
-                submodule = getattr(submodule, sub_name)
-            setattr(submodule,  param_name.split('.')[-1], torch.nn.Parameter(param))
-        model.transformer.h[i] = block_on_device
-        model.transformer.h[i] = XlaFullyShardedDataParallel(model.transformer.h[i])
+            # replace all blocks
+            for i, block in enumerate(model.transformer.h):
+                print(f'replace transformer.h[{i}]')
+                lora_params = {}
+                with torch.device("cpu"):
+                    block_on_device = Block(model.config)
+                    block_on_device.apply(model._init_weights)
+                for param_name, param in block_on_device.named_parameters():
+                    key = f"transformer.h.{i}.{param_name}"
+                    if lora_filter(key, None):
+                        lora_params[param_name] = param
+                    else:
+                        keys = block_on_device.load_state_dict({param_name: state_dict[key]}, strict=False)
+                for param_name, param in zip(lora_params.keys(), lora_params.values()):
+                    submodule = block_on_device
+                    for sub_name in param_name.split('.'):
+                        submodule = getattr(submodule, sub_name)
+                    setattr(submodule,  param_name.split('.')[-1], torch.nn.Parameter(param))
+                model.transformer.h[i] = block_on_device
+                model.transformer.h[i] = XlaFullyShardedDataParallel(model.transformer.h[i])
 
-    # replace remaining 'meta' params
-    for submodule in model.modules():
-        for param_name, param in submodule.named_parameters(recurse=False):
-            if param.is_meta:
-                if fabric.global_rank == 0:
-                    state_dict_param = state_dict[param_name]
-                setattr(submodule, param_name, torch.nn.Parameter(state_dict_param))
+            # replace remaining 'meta' params
+            for submodule in model.modules():
+                for param_name, param in submodule.named_parameters(recurse=False):
+                    if param.is_meta:
+                        if fabric.global_rank == 0:
+                            state_dict_param = state_dict[param_name]
+                        setattr(submodule, param_name, torch.nn.Parameter(state_dict_param))
 
-    fabric.print(f'Memory usage after all model init (before root fsdp sharding): {(psutil.virtual_memory()[3]/1e9):.02f} GB')
-    model = fabric.setup(model)
-    fabric.print(f'Memory usage after all model init (after root fsdp sharding) {(psutil.virtual_memory()[3]/1e9):.02f} GB')
+            model = fabric.setup_module(model)
+            print(f'Memory usage after rank {rank} model init: {(psutil.virtual_memory()[3]/1e9):.02f} GB')
+            print('model.lm_head.weight.device: ' + str(model.lm_head.weight.device))
 
-    print('model.lm_head.weight.device: ' + str(model.lm_head.weight.device))
+        fabric.barrier('local_model_init')
+
+
 
     if check_model_init:
         from lightning.fabric.utilities.rank_zero import rank_zero_warn
@@ -244,7 +251,7 @@ def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path, 
         for i, _ in enumerate(model2.transformer.h):
             model2.transformer.h[i] = XlaFullyShardedDataParallel(model2.transformer.h[i])
         model2 = XlaFullyShardedDataParallel(model2)
-        
+
         for sm1, sm2 in zip(model.modules(), model2.modules()):
             for (n1, p1), (n2, p2) in zip(sm1.named_parameters(), sm2.named_parameters()):
                 for rank in range(fabric.world_size):
@@ -288,7 +295,7 @@ def train(
     tokenizer = Tokenizer(checkpoint_dir)
     max_seq_length, longest_seq_length, longest_seq_ix = get_max_seq_length(train_data)
 
-    validate(fabric, model, val_data, tokenizer, longest_seq_length)  # sanity check
+    # validate(fabric, model, val_data, tokenizer, longest_seq_length)  # sanity check
 
     with torch.device("meta"):
         meta_model = GPT(model.config)
@@ -447,13 +454,12 @@ def save_lora_checkpoint(fabric, model, file_path: Path):
     fabric.save(file_path, {"model": model}, filter={"model": lora_filter})
 
 
-def broadcast(obj: TBroadcast, src: int = 0) -> TBroadcast:
-    if not torch.distributed.is_initialized():
-        return obj
-    from lightning.fabric.utilities.distributed import group as _group
+def broadcast(obj: TBroadcast, src: int = 0, group=_group.WORLD) -> TBroadcast:
+    # if not torch.distributed.is_initialized():
+        # return obj
 
     obj = [obj]
-    torch.distributed.broadcast_object_list(obj, src, group=_group.WORLD)
+    torch.distributed.broadcast_object_list(obj, src, group=group)
     return obj[0]
 
 
