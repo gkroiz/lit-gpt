@@ -157,23 +157,23 @@ def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path, 
             )
         else:
             lm_head_on_device = nn.Linear(model.config.n_embd, config.padded_vocab_size, bias=False)
-    for param_name, _ in model.lm_head.named_parameters():
+    for param_name, param in model.lm_head.named_parameters():
         key = f"lm_head.{param_name}"
-        to_broadcast = state_dict[key] if fabric.global_rank == 0 else {}
-        to_load = dist.broadcast(to_broadcast, src=0)
-        keys = lm_head_on_device.load_state_dict({param_name: to_load}, strict=False)
+        broadcast_param = state_dict[key] if fabric.global_rank == 0 else torch.zeros(param.size(), dtype=torch.float16, device=torch.device('cpu'))
+        dist.broadcast(broadcast_param, src=0, group=group_gloo)
+        keys = lm_head_on_device.load_state_dict({param_name: broadcast_param}, strict=False)
         assert not keys.unexpected_keys
     model.lm_head = lm_head_on_device
 
     # replace wte
     fabric.print('replace transformer.wte')
     with torch.device("cpu"):
-            wte_on_device = nn.Embedding(model.config.padded_vocab_size, model.config.n_embd)
-    for param_name, _ in model.transformer.wte.named_parameters():
+        wte_on_device = nn.Embedding(model.config.padded_vocab_size, model.config.n_embd)
+    for param_name, param in model.transformer.wte.named_parameters():
         key = f"transformer.wte.{param_name}"
-        to_broadcast = state_dict[key] if fabric.global_rank == 0 else {}
-        to_load = dist.broadcast(to_broadcast, src=0)
-        keys = wte_on_device.load_state_dict({param_name: to_load}, strict=False)
+        broadcast_param = state_dict[key] if fabric.global_rank == 0 else torch.zeros(param.size(), dtype=torch.float16, device=torch.device('cpu'))
+        dist.broadcast(broadcast_param, src=0, group=group_gloo)
+        keys = wte_on_device.load_state_dict({param_name: broadcast_param}, strict=False)
         assert not keys.unexpected_keys
     model.transformer.wte = wte_on_device
 
@@ -182,16 +182,16 @@ def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path, 
     with torch.device("cpu"):
         ln_f_on_device = model.config.norm_class(model.config.n_embd, eps=model.config.norm_eps)
     key = 'transformer.ln_f.weight'
-    for param_name, _ in model.transformer.ln_f.named_parameters():
+    for param_name, param in model.transformer.ln_f.named_parameters():
         key = f"transformer.ln_f.{param_name}"
-        to_broadcast = state_dict[key] if fabric.global_rank == 0 else {}
-        to_load = dist.broadcast(to_broadcast, src=0)
-        keys = ln_f_on_device.load_state_dict({param_name: to_load}, strict=False)
+        broadcast_param = state_dict[key] if fabric.global_rank == 0 else torch.zeros(param.size(), dtype=torch.float16, device=torch.device('cpu'))
+        dist.broadcast(broadcast_param, src=0, group=group_gloo)
+        keys = ln_f_on_device.load_state_dict({param_name: broadcast_param}, strict=False)
     model.transformer.ln_f = ln_f_on_device
 
     # replace all blocks
     for i, block in enumerate(model.transformer.h):
-        fabric.print(f'replace transformer.h[{i}].')
+        fabric.print(f'replace transformer.h[{i}]')
         lora_params = {}
         with torch.device("cpu"):
             block_on_device = Block(model.config)
@@ -201,9 +201,9 @@ def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path, 
             if lora_filter(key, None):
                 lora_params[param_name] = param
             else:
-                to_broadcast = state_dict[key] if fabric.global_rank == 0 else {}
-                to_load = dist.broadcast(to_broadcast, src=0)
-                keys = block_on_device.load_state_dict({param_name: to_load}, strict=False)
+                broadcast_param = state_dict[key] if fabric.global_rank == 0 else torch.zeros(param.size(), dtype=torch.float16, device=torch.device('cpu'))
+                dist.broadcast(broadcast_param, src=0, group=group_gloo)
+                keys = block_on_device.load_state_dict({param_name: broadcast_param}, strict=False)
         for param_name, param in zip(lora_params.keys(), lora_params.values()):
             submodule = block_on_device
             for sub_name in param_name.split('.'):
@@ -216,9 +216,9 @@ def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path, 
     for submodule in model.modules():
         for param_name, param in submodule.named_parameters(recurse=False):
             if param.is_meta:
-                if fabric.global_rank == 0:
-                    state_dict_param = state_dict[param_name]
-                setattr(submodule, param_name, torch.nn.Parameter(state_dict_param))
+                broadcast_param = state_dict[param_name] if fabric.global_rank == 0 else torch.zeros(param.size(), dtype=torch.float16, device=torch.device('cpu'))
+                dist.broadcast(broadcast_param, src=0, group=group_gloo)
+                setattr(submodule, param_name, torch.nn.Parameter(broadcast_param))
 
     fabric.print(f'Memory usage after all model init (before root fsdp sharding): {(psutil.virtual_memory()[3]/1e9):.02f} GB')
     model = fabric.setup(model)
@@ -241,7 +241,7 @@ def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path, 
 
         for i, _ in enumerate(model2.transformer.h):
             model2.transformer.h[i] = XlaFullyShardedDataParallel(model2.transformer.h[i])
-        model2 = XlaFullyShardedDataParallel(model2)
+        model2 = fabric.setup_module(model2)
         
         for sm1, sm2 in zip(model.modules(), model2.modules()):
             for (n1, p1), (n2, p2) in zip(sm1.named_parameters(), sm2.named_parameters()):
@@ -251,6 +251,7 @@ def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path, 
                     fabric.barrier('weights_check')
                 print()
 
+    fabric.print('mark only lora as trainable')
     mark_only_lora_as_trainable(model)
 
     trainable_params = [p for p in model.parameters() if p.requires_grad]
