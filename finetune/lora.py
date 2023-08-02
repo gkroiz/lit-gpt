@@ -154,11 +154,12 @@ def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path, 
     for rank in range(devices):
         start = time.time()
         fabric.print(f'----------model init on rank {rank}--------------')
+        print(f'rank: {rank}, fabric.local_rank: {fabric.local_rank}')
         if rank == fabric.local_rank:
             with torch.device("meta"):
                 model = GPT(config)
             state_dict = torch.load(checkpoint_path)
-
+            """
             # replace lm_head
             print('replace lm_head')
             with torch.device("cpu"):
@@ -226,15 +227,17 @@ def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path, 
                     if param.is_meta:
                         state_dict_param = state_dict[param_name]
                         setattr(submodule, param_name, torch.nn.Parameter(state_dict_param))
-
+            
             model = fabric.setup_module(model)
             print(f'Memory usage after rank {rank} model init: {(psutil.virtual_memory()[3]/1e9):.02f} GB')
             print('model.lm_head.weight.device: ' + str(model.lm_head.weight.device))
+            """
 
         fabric.barrier('local_model_init')
         end = time.time()
         fabric.print(f'time to load on rank {rank} was {(start-end):.02f}s')
 
+    exit()
 
 
     if check_model_init:
