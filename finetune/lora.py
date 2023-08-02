@@ -151,10 +151,10 @@ def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path, 
         # model = GPT(config)
 
     model = None
-    for rank in range(fabric.world_size):
+    for rank in range(devices):
         start = time.time()
         fabric.print(f'----------model init on rank {rank}--------------')
-        if rank == fabric.global_rank:
+        if rank == fabric.local_rank:
             with torch.device("meta"):
                 model = GPT(config)
             state_dict = torch.load(checkpoint_path)
@@ -224,8 +224,7 @@ def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path, 
             for submodule in model.modules():
                 for param_name, param in submodule.named_parameters(recurse=False):
                     if param.is_meta:
-                        if fabric.global_rank == 0:
-                            state_dict_param = state_dict[param_name]
+                        state_dict_param = state_dict[param_name]
                         setattr(submodule, param_name, torch.nn.Parameter(state_dict_param))
 
             model = fabric.setup_module(model)
@@ -253,7 +252,7 @@ def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path, 
 
         for i, _ in enumerate(model2.transformer.h):
             model2.transformer.h[i] = XlaFullyShardedDataParallel(model2.transformer.h[i])
-        model2 = XlaFullyShardedDataParallel(model2)
+        model2 = fabric.setup(model2)
 
         for sm1, sm2 in zip(model.modules(), model2.modules()):
             for (n1, p1), (n2, p2) in zip(sm1.named_parameters(), sm2.named_parameters()):
@@ -275,6 +274,8 @@ def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path, 
     optimizer = fabric.setup_optimizers(optimizer)
 
     fabric.seed_everything(1337 + fabric.global_rank)
+
+    exit()
 
     train_time = time.time()
     train(fabric, model, optimizer, train_data, val_data, checkpoint_dir, out_dir, speed_monitor)
