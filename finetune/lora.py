@@ -94,7 +94,7 @@ def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path, 
     import torch_xla.experimental.pjrt_backend
     import torch.distributed as dist
     dist.init_process_group('xla', init_method='pjrt://')
-    group_gloo = dist.new_group(backend="gloo")
+    group_gloo = dist.new_group(ranks = [_ for _ in range(fabric.world_size)], backend="gloo")
 
     fabric.print('----------after cpu dist init--------------')
 
@@ -140,7 +140,8 @@ def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path, 
     fabric.print('----------model init--------------')
     fabric.print(f'Memory usage before model init sequential: {(psutil.virtual_memory()[3]/1e9):.02f} GB')
     if fabric.global_rank == 0:
-        state_dict = torch.load(checkpoint_path)
+        state_dict = torch.load(checkpoint_path, map_location='cpu')
+    fabric.barrier('wait')
     fabric.print(f'Memory usage after loading checkpoint onto master rank: {(psutil.virtual_memory()[3]/1e9):.02f} GB')
 
     # replace lm_head
@@ -159,8 +160,10 @@ def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path, 
             lm_head_on_device = nn.Linear(model.config.n_embd, config.padded_vocab_size, bias=False)
     for param_name, param in model.lm_head.named_parameters():
         key = f"lm_head.{param_name}"
-        broadcast_param = state_dict[key] if fabric.global_rank == 0 else torch.zeros(param.size(), dtype=torch.float16, device=torch.device('cpu'))
-        dist.broadcast(broadcast_param, src=0, group=group_gloo)
+        broadcast_param = state_dict[key] if fabric.global_rank == 0 else torch.empty_like(param, dtype=torch.bfloat16, device="cpu")
+        broadcast_param = broadcast_param.type(torch.float32)
+        dist.broadcast(tensor=broadcast_param, src=0, group=group_gloo)
+        broadcast_param = broadcast_param.type(torch.bfloat16)
         keys = lm_head_on_device.load_state_dict({param_name: broadcast_param}, strict=False)
         assert not keys.unexpected_keys
     model.lm_head = lm_head_on_device
@@ -171,8 +174,10 @@ def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path, 
         wte_on_device = nn.Embedding(model.config.padded_vocab_size, model.config.n_embd)
     for param_name, param in model.transformer.wte.named_parameters():
         key = f"transformer.wte.{param_name}"
-        broadcast_param = state_dict[key] if fabric.global_rank == 0 else torch.zeros(param.size(), dtype=torch.float16, device=torch.device('cpu'))
-        dist.broadcast(broadcast_param, src=0, group=group_gloo)
+        broadcast_param = state_dict[key] if fabric.global_rank == 0 else torch.empty_like(param, dtype=torch.bfloat16, device="cpu")
+        broadcast_param = broadcast_param.type(torch.float32)
+        dist.broadcast(tensor=broadcast_param, src=0, group=group_gloo)
+        broadcast_param = broadcast_param.type(torch.bfloat16)
         keys = wte_on_device.load_state_dict({param_name: broadcast_param}, strict=False)
         assert not keys.unexpected_keys
     model.transformer.wte = wte_on_device
@@ -184,8 +189,10 @@ def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path, 
     key = 'transformer.ln_f.weight'
     for param_name, param in model.transformer.ln_f.named_parameters():
         key = f"transformer.ln_f.{param_name}"
-        broadcast_param = state_dict[key] if fabric.global_rank == 0 else torch.zeros(param.size(), dtype=torch.float16, device=torch.device('cpu'))
-        dist.broadcast(broadcast_param, src=0, group=group_gloo)
+        broadcast_param = state_dict[key] if fabric.global_rank == 0 else torch.empty_like(param, dtype=torch.bfloat16, device="cpu")
+        broadcast_param = broadcast_param.type(torch.float32)
+        dist.broadcast(tensor=broadcast_param, src=0, group=group_gloo)
+        broadcast_param = broadcast_param.type(torch.bfloat16)
         keys = ln_f_on_device.load_state_dict({param_name: broadcast_param}, strict=False)
     model.transformer.ln_f = ln_f_on_device
 
@@ -201,8 +208,10 @@ def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path, 
             if lora_filter(key, None):
                 lora_params[param_name] = param
             else:
-                broadcast_param = state_dict[key] if fabric.global_rank == 0 else torch.zeros(param.size(), dtype=torch.float16, device=torch.device('cpu'))
-                dist.broadcast(broadcast_param, src=0, group=group_gloo)
+                broadcast_param = state_dict[key] if fabric.global_rank == 0 else torch.empty_like(param, dtype=torch.bfloat16, device="cpu")
+                broadcast_param = broadcast_param.type(torch.float32)
+                dist.broadcast(tensor=broadcast_param, src=0, group=group_gloo)
+                broadcast_param = broadcast_param.type(torch.bfloat16)
                 keys = block_on_device.load_state_dict({param_name: broadcast_param}, strict=False)
         for param_name, param in zip(lora_params.keys(), lora_params.values()):
             submodule = block_on_device
@@ -216,8 +225,10 @@ def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path, 
     for submodule in model.modules():
         for param_name, param in submodule.named_parameters(recurse=False):
             if param.is_meta:
-                broadcast_param = state_dict[param_name] if fabric.global_rank == 0 else torch.zeros(param.size(), dtype=torch.float16, device=torch.device('cpu'))
-                dist.broadcast(broadcast_param, src=0, group=group_gloo)
+                broadcast_param = state_dict[param_name] if fabric.global_rank == 0 else torch.empty_like(param, dtype=torch.bfloat16, device="cpu")
+                broadcast_param = broadcast_param.type(torch.float32)
+                dist.broadcast(tensor=broadcast_param, src=0, group=group_gloo)
+                broadcast_param = broadcast_param.type(torch.bfloat16)
                 setattr(submodule, param_name, torch.nn.Parameter(broadcast_param))
 
     fabric.print(f'Memory usage after all model init (before root fsdp sharding): {(psutil.virtual_memory()[3]/1e9):.02f} GB')
@@ -247,6 +258,7 @@ def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path, 
             for (n1, p1), (n2, p2) in zip(sm1.named_parameters(), sm2.named_parameters()):
                 for rank in range(fabric.world_size):
                     if rank == fabric.global_rank:
+                        assert p1.size() == p2.size()
                         print(f'rank: {rank}, p-name: {n1}\np1.size(): {p1.size()}, p2.size(): {p2.size()}, mse_loss: {nn.MSELoss()(p1, p2)}')
                     fabric.barrier('weights_check')
                 print()
