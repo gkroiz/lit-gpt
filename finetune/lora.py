@@ -22,10 +22,11 @@ from lit_gpt.utils import lazy_load, check_valid_checkpoint_dir, step_csv_logger
 from lit_gpt.speed_monitor import SpeedMonitorFabric as SpeedMonitor, measure_flops, estimate_flops
 from scripts.prepare_alpaca import generate_prompt
 
+import torch_xla.core.xla_model as xm
 
-eval_interval = 100
-save_interval = 100
-eval_iters = 100
+eval_interval = 1000
+save_interval = 1000
+eval_iters = 1000
 log_interval = 1
 devices = 4
 # change this value to force a maximum sequence length
@@ -33,9 +34,10 @@ override_max_seq_length = None
 
 # Hyperparameters
 learning_rate = 3e-4
-batch_size = 1
-micro_batch_size = 1
-gradient_accumulation_iters = batch_size // micro_batch_size
+# batch_size = 64
+micro_batch_size = 16
+# gradient_accumulation_iters = batch_size // (micro_batch_size * xm.xrt_world_size())
+gradient_accumulation_iters = 1
 assert gradient_accumulation_iters > 0
 max_iters = 100  # train dataset size
 weight_decay = 0.01
@@ -68,9 +70,7 @@ def setup(
         if tpu:
             # For multi-host TPU training, the device count for Fabric is limited to the count on a single host.
             fabric_devices = "auto"
-            from torch_xla.distributed.fsdp.wrap import always_wrap_policy
-
-            strategy = XLAFSDPStrategy(auto_wrap_policy=always_wrap_policy)
+            strategy = XLAFSDPStrategy()
         else:
             precision="bf16-true"
             strategy=FSDPStrategy(
@@ -299,7 +299,7 @@ def train(
     tokenizer = Tokenizer(checkpoint_dir)
     max_seq_length, longest_seq_length, longest_seq_ix = get_max_seq_length(train_data)
 
-    validate(fabric, model, val_data, tokenizer, longest_seq_length)  # sanity check
+    # validate(fabric, model, val_data, tokenizer, longest_seq_length)  # sanity check
 
     with torch.device("meta"):
         meta_model = GPT(model.config)
@@ -385,27 +385,28 @@ def validate(
     for k in range(eval_iters):
         input_ids, targets = get_batch(fabric, val_data, longest_seq_length)
         logits = model(input_ids)
+        loss = chunked_cross_entropy(logits, targets, chunk_size=0)
         import torch_xla.core.xla_model as xm
 
         xm.mark_step()
-        loss = chunked_cross_entropy(logits, targets, chunk_size=0)
+
         losses[k] = loss.item()
     val_loss = losses.mean()
 
     # produce an example:
-    instruction = "Recommend a movie for me to watch during the weekend and explain the reason."
-    fabric.print(instruction)
-    sample = {"instruction": instruction, "input": ""}
-    prompt = generate_prompt(sample)
-    encoded = tokenizer.encode(prompt, device=model.device)
-    max_returned_tokens = len(encoded) + 100
-    output = generate(
-        model, idx=encoded, max_returned_tokens=max_returned_tokens, max_seq_length=max_returned_tokens, temperature=0.8
-    )
-    output = tokenizer.decode(output)
-    fabric.print(output)
+    # instruction = "Recommend a movie for me to watch during the weekend and explain the reason."
+    # fabric.print(instruction)
+    # sample = {"instruction": instruction, "input": ""}
+    # prompt = generate_prompt(sample)
+    # encoded = tokenizer.encode(prompt, device=model.device)
+    # max_returned_tokens = len(encoded) + 100
+    # output = generate(
+    #     model, idx=encoded, max_returned_tokens=max_returned_tokens, max_seq_length=max_returned_tokens, temperature=0.8
+    # )
+    # output = tokenizer.decode(output)
+    # fabric.print(output)
 
-    model.reset_cache()
+    # model.reset_cache()
 
     model.train()
     return val_loss.item()
