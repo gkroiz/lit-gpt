@@ -6,7 +6,7 @@ from typing import Optional, List, Dict, Tuple
 
 import lightning as L
 import torch
-from lightning.fabric.strategies import XLAStrategy, FSDPStrategy
+from lightning.fabric.strategies import XLAFSDPStrategy, FSDPStrategy
 
 # support running without installing as a package
 wd = Path(__file__).parent.parent.resolve()
@@ -30,7 +30,7 @@ override_max_seq_length = None
 
 # Hyperparameters
 learning_rate = 3e-4
-batch_size = 128
+batch_size = 4
 micro_batch_size = 4
 gradient_accumulation_iters = batch_size // micro_batch_size
 assert gradient_accumulation_iters > 0
@@ -62,9 +62,22 @@ def setup(
     fabric_devices = devices
     if fabric_devices > 1:
         if tpu:
+            from functools import partial
+            from torch_xla.distributed.fsdp.wrap import transformer_auto_wrap_policy
+            from torch_xla.distributed.fsdp import checkpoint_module
+            from torch_xla.distributed.fsdp import XlaFullyShardedDataParallel as XLAFSDP
             # For multi-host TPU training, the device count for Fabric is limited to the count on a single host.
             fabric_devices = "auto"
-            strategy = XLAStrategy(sync_module_states=False)
+
+            auto_wrap_policy = partial(transformer_auto_wrap_policy, transformer_layer_cls={Block})
+            auto_wrapper_callable = lambda m, *args, **kwargs: XLAFSDP(
+                checkpoint_module(m), *args, **kwargs)
+            
+            strategy = XLAFSDPStrategy(
+                auto_wrap_policy=auto_wrap_policy,
+                auto_wrapper_callable=auto_wrapper_callable,
+                compute_dtype=torch.bfloat16
+            )
         else:
             precision="bf16-true"
             strategy=FSDPStrategy(
@@ -127,7 +140,11 @@ def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path):
     fabric.print(f"Number of non trainable parameters: {num_params:,}")
 
     optimizer = torch.optim.AdamW(trainable_params, lr=learning_rate, weight_decay=weight_decay)
-    model, optimizer = fabric.setup(model, optimizer)
+    if fabric.device.type == "xla":
+        model = fabric.setup_module(model)
+        optimizer = fabric.setup_optimizers(optimizer)
+    else:
+        model, optimizer = fabric.setup(model, optimizer)
 
     fabric.seed_everything(1337 + fabric.global_rank)
 
