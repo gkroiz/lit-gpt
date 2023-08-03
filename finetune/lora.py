@@ -23,6 +23,7 @@ from lit_gpt.speed_monitor import SpeedMonitorFabric as SpeedMonitor, measure_fl
 from scripts.prepare_alpaca import generate_prompt
 
 import torch_xla.core.xla_model as xm
+from torch_xla.distributed.fsdp import checkpoint_module
 
 eval_interval = 1000
 save_interval = 1000
@@ -35,7 +36,7 @@ override_max_seq_length = None
 # Hyperparameters
 learning_rate = 3e-4
 # batch_size = 64
-micro_batch_size = 16
+micro_batch_size = 1
 # gradient_accumulation_iters = batch_size // (micro_batch_size * xm.xrt_world_size())
 gradient_accumulation_iters = 1
 assert gradient_accumulation_iters > 0
@@ -70,7 +71,7 @@ def setup(
         if tpu:
             # For multi-host TPU training, the device count for Fabric is limited to the count on a single host.
             fabric_devices = "auto"
-            strategy = XLAFSDPStrategy()
+            strategy = XLAFSDPStrategy(compute_dtype=torch.bfloat16)
         else:
             precision="bf16-true"
             strategy=FSDPStrategy(
@@ -219,7 +220,7 @@ def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path, 
                 submodule = getattr(submodule, sub_name)
             setattr(submodule,  param_name.split('.')[-1], torch.nn.Parameter(param))
         model.transformer.h[i] = block_on_device
-        model.transformer.h[i] = XlaFullyShardedDataParallel(model.transformer.h[i])
+        model.transformer.h[i] = XlaFullyShardedDataParallel(checkpoint_module(model.transformer.h[i]), compute_dtype=torch.bfloat16)
 
     # replace remaining 'meta' params
     for submodule in model.modules():
@@ -251,7 +252,7 @@ def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path, 
             model2.load_state_dict(checkpoint, strict=False)
 
         for i, _ in enumerate(model2.transformer.h):
-            model2.transformer.h[i] = XlaFullyShardedDataParallel(model2.transformer.h[i])
+            model2.transformer.h[i] = XlaFullyShardedDataParallel(checkpoint_module(model2.transformer.h[i]))
         model2 = fabric.setup_module(model2)
         
         for sm1, sm2 in zip(model.modules(), model2.modules()):
