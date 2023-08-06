@@ -6,7 +6,8 @@ from typing import Optional, Tuple, Dict, List
 
 import lightning as L
 import torch
-from lightning.fabric.strategies import FSDPStrategy, XLAStrategy
+import torch.nn as nn
+from lightning.fabric.strategies import FSDPStrategy, XLAFSDPStrategy
 
 # support running without installing as a package
 wd = Path(__file__).parent.parent.resolve()
@@ -21,21 +22,21 @@ from scripts.prepare_alpaca import generate_prompt
 
 eval_interval = 600
 save_interval = 1000
-eval_iters = 100
+eval_iters = 1000
 log_interval = 1
-devices = 1
+devices = 4
 # change this value to force a maximum sequence length
 override_max_seq_length = None
 
 # Hyperparameters
 learning_rate = 3e-3
-batch_size = 64 / devices
+batch_size = 1 #64 / devices
 micro_batch_size = 1
 gradient_accumulation_iters = batch_size // micro_batch_size
 assert gradient_accumulation_iters > 0
 epoch_size = 50000  # train dataset size
 num_epochs = 5
-max_iters = num_epochs * (epoch_size // micro_batch_size) // devices
+max_iters = 20 #num_epochs * (epoch_size // micro_batch_size) // devices
 weight_decay = 0.02
 warmup_steps = 2 * (epoch_size // micro_batch_size) // devices // gradient_accumulation_iters  # 2 epochs
 
@@ -56,7 +57,7 @@ def setup(
         if tpu:
             # For multi-host TPU training, the device count for Fabric is limited to the count on a single host.
             fabric_devices = "auto"
-            strategy = XLAStrategy(sync_module_states=False)
+            strategy = XLAFSDPStrategy(compute_dtype=torch.bfloat16)
         else:
             strategy = FSDPStrategy(
                 auto_wrap_policy={Block},
@@ -74,6 +75,21 @@ def setup(
 
 
 def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path):
+    if fabric.device.type == "xla":
+        import psutil
+        from torch_xla.distributed.fsdp.xla_fully_sharded_data_parallel import XlaFullyShardedDataParallel
+        from torch_xla.distributed.fsdp import checkpoint_module
+        import torch_xla.core.xla_model as xm
+        import torch_xla.debug.profiler as xp
+
+        server = xp.start_server(3294)
+        # setup torch distributed group for cpu
+        # Required for `pjrt://` init_method
+        import torch_xla.experimental.pjrt_backend
+        import torch.distributed as dist
+        dist.init_process_group('xla', init_method='pjrt://')
+        group_gloo = dist.new_group(ranks = [_ for _ in range(fabric.world_size)], backend="gloo")
+
     fabric.print(hparams)
     check_valid_checkpoint_dir(checkpoint_dir)
 
@@ -95,11 +111,21 @@ def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path):
     with lazy_load(checkpoint_path) as checkpoint:
         model.load_state_dict(checkpoint)
 
+    from functools import partial
+    from torch_xla.distributed.fsdp.wrap import transformer_auto_wrap_policy
+
+    fabric._strategy._fsdp_kwargs["auto_wrap_policy"] = partial(transformer_auto_wrap_policy, transformer_layer_cls={Block})
+    fabric._strategy._fsdp_kwargs["auto_wrap_policy"] = lambda m, *args, **kwargs: XlaFullyShardedDataParallel(
+        checkpoint_module(m), *args, **kwargs)
     num_params = sum(p.numel() for p in model.parameters())
     fabric.print(f"Number of trainable parameters: {num_params:,}")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
-    model, optimizer = fabric.setup(model, optimizer)
+    if fabric.device.type == "xla":
+        model = fabric.setup_module(model)
+        optimizer = fabric.setup_optimizers(optimizer)
+    else:
+        model, optimizer = fabric.setup(model, optimizer)
 
     fabric.seed_everything(1337 + fabric.global_rank)
 
@@ -109,7 +135,7 @@ def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path):
 
     # Save the final checkpoint at the end of training
     save_path = out_dir / "lit_model_finetuned.pth"
-    save_checkpoint(fabric, model, save_path)
+    # save_checkpoint(fabric, model, save_path)
 
 
 def train(
@@ -125,7 +151,7 @@ def train(
     tokenizer = Tokenizer(checkpoint_dir)
     max_seq_length, longest_seq_length, longest_seq_ix = get_max_seq_length(train_data)
 
-    validate(fabric, model, val_data, tokenizer, longest_seq_length)  # sanity check
+    # validate(fabric, model, val_data, tokenizer, longest_seq_length)  # sanity check
 
     with torch.device("meta"):
         meta_model = GPT(model.config)
