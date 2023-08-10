@@ -6,7 +6,9 @@ from typing import Optional, Tuple, Dict, List
 
 import lightning as L
 import torch
-from lightning.fabric.strategies import FSDPStrategy, XLAStrategy
+import psutil
+import torch.nn as nn
+from lightning.fabric.strategies import FSDPStrategy, XLAFSDPStrategy
 
 # support running without installing as a package
 wd = Path(__file__).parent.parent.resolve()
@@ -21,21 +23,21 @@ from scripts.prepare_alpaca import generate_prompt
 
 eval_interval = 600
 save_interval = 1000
-eval_iters = 100
+eval_iters = 1000
 log_interval = 1
-devices = 1
+devices = 4
 # change this value to force a maximum sequence length
 override_max_seq_length = None
 
 # Hyperparameters
 learning_rate = 3e-3
-batch_size = 64 / devices
+batch_size = 1#64 / devices
 micro_batch_size = 1
 gradient_accumulation_iters = batch_size // micro_batch_size
 assert gradient_accumulation_iters > 0
 epoch_size = 50000  # train dataset size
 num_epochs = 5
-max_iters = num_epochs * (epoch_size // micro_batch_size) // devices
+max_iters = 100#num_epochs * (epoch_size // micro_batch_size) // devices
 weight_decay = 0.02
 warmup_steps = 2 * (epoch_size // micro_batch_size) // devices // gradient_accumulation_iters  # 2 epochs
 
@@ -56,7 +58,7 @@ def setup(
         if tpu:
             # For multi-host TPU training, the device count for Fabric is limited to the count on a single host.
             fabric_devices = "auto"
-            strategy = XLAStrategy(sync_module_states=False)
+            strategy = XLAFSDPStrategy(compute_dtype=torch.bfloat16)
         else:
             strategy = FSDPStrategy(
                 auto_wrap_policy={Block},
@@ -74,6 +76,21 @@ def setup(
 
 
 def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path):
+    if fabric.device.type == 'xla':
+        from torch_xla.distributed.fsdp.xla_fully_sharded_data_parallel import XlaFullyShardedDataParallel
+        import torch_xla.core.xla_model as xm
+        from torch_xla.distributed.fsdp import checkpoint_module
+
+        # Required for `pjrt://` init_method
+        import torch_xla.experimental.pjrt_backend
+        import torch.distributed as dist
+        import torch_xla.debug.profiler as xp
+        
+        server = xp.start_server(3294)
+
+        dist.init_process_group('xla', init_method='pjrt://')
+        group_gloo = dist.new_group(ranks = [_ for _ in range(fabric.world_size)], backend="gloo")
+
     fabric.print(hparams)
     check_valid_checkpoint_dir(checkpoint_dir)
 
@@ -90,16 +107,79 @@ def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path):
     config = Config.from_name(name=checkpoint_dir.name)
     checkpoint_path = checkpoint_dir / "lit_model.pth"
     fabric.print(f"Loading model {str(checkpoint_path)!r} with {config.__dict__}")
-    with fabric.init_module(empty_init=False):
+    with torch.device("meta"):
         model = GPT(config)
-    with lazy_load(checkpoint_path) as checkpoint:
-        model.load_state_dict(checkpoint)
+
+    fabric.print(f'Memory usage before model init sequential: {(psutil.virtual_memory()[3]/1e9):.02f} GB')
+    if fabric.global_rank == 0:
+        state_dict = torch.load(checkpoint_path)
+    fabric.barrier('wait')
+    fabric.print(f'Memory usage after loading checkpoint onto master rank: {(psutil.virtual_memory()[3]/1e9):.02f} GB')
+
+    # replace lm_head
+    fabric.print('replace lm_head')
+    with torch.device("cpu"):
+        lm_head_on_device = nn.Linear(model.config.n_embd, config.padded_vocab_size, bias=False)
+    for param_name, param in model.lm_head.named_parameters():
+        key = f"lm_head.{param_name}"
+        broadcast_param = state_dict[key] if fabric.global_rank == 0 else torch.empty_like(param, dtype=torch.bfloat16, device="cpu")
+        broadcast_param = broadcast_param.type(torch.float32)
+        dist.broadcast(tensor=broadcast_param, src=0, group=group_gloo)
+        broadcast_param = broadcast_param.type(torch.bfloat16)
+        keys = lm_head_on_device.load_state_dict({param_name: broadcast_param}, strict=False)
+        assert not keys.unexpected_keys
+    model.lm_head = lm_head_on_device
+
+    # replace wte
+    fabric.print('replace transformer.wte')
+    with torch.device("cpu"):
+        wte_on_device = nn.Embedding(model.config.padded_vocab_size, model.config.n_embd)
+    for param_name, param in model.transformer.wte.named_parameters():
+        key = f"transformer.wte.{param_name}"
+        broadcast_param = state_dict[key] if fabric.global_rank == 0 else torch.empty_like(param, dtype=torch.bfloat16, device="cpu")
+        broadcast_param = broadcast_param.type(torch.float32)
+        dist.broadcast(tensor=broadcast_param, src=0, group=group_gloo)
+        broadcast_param = broadcast_param.type(torch.bfloat16)
+        keys = wte_on_device.load_state_dict({param_name: broadcast_param}, strict=False)
+        assert not keys.unexpected_keys
+    model.transformer.wte = wte_on_device
+
+    # replace ln_f
+    fabric.print('replace transformer.ln_f')
+    with torch.device("cpu"):
+        ln_f_on_device = model.config.norm_class(model.config.n_embd, eps=model.config.norm_eps)
+    key = 'transformer.ln_f.weight'
+    for param_name, param in model.transformer.ln_f.named_parameters():
+        key = f"transformer.ln_f.{param_name}"
+        broadcast_param = state_dict[key] if fabric.global_rank == 0 else torch.empty_like(param, dtype=torch.bfloat16, device="cpu")
+        broadcast_param = broadcast_param.type(torch.float32)
+        dist.broadcast(tensor=broadcast_param, src=0, group=group_gloo)
+        broadcast_param = broadcast_param.type(torch.bfloat16)
+        keys = ln_f_on_device.load_state_dict({param_name: broadcast_param}, strict=False)
+        assert not keys.unexpected_keys
+    model.transformer.ln_f = ln_f_on_device
+
+    # replace all blocks
+    for i in range(config.n_layer):
+        fabric.print(f'replace transformer.h[{i}]')
+        with torch.device("cpu"):
+            block_on_device = Block(model.config)
+        for param_name, param in block_on_device.named_parameters():
+            key = f"transformer.h.{i}.{param_name}"
+            broadcast_param = state_dict[key] if fabric.global_rank == 0 else torch.empty_like(param, dtype=torch.bfloat16, device="cpu")
+            broadcast_param = broadcast_param.type(torch.float32)
+            dist.broadcast(tensor=broadcast_param, src=0, group=group_gloo)
+            broadcast_param = broadcast_param.type(torch.bfloat16)
+            keys = block_on_device.load_state_dict({param_name: broadcast_param}, strict=False)
+            assert not keys.unexpected_keys
+        model.transformer.h[i] = XlaFullyShardedDataParallel(checkpoint_module(block_on_device), disable_reshard_on_root=False, compute_dtype=torch.bfloat16)
 
     num_params = sum(p.numel() for p in model.parameters())
     fabric.print(f"Number of trainable parameters: {num_params:,}")
 
+    model = fabric.setup(model, move_to_device=False)
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
-    model, optimizer = fabric.setup(model, optimizer)
+    optimizer = fabric.setup_optimizers(optimizer)
 
     fabric.seed_everything(1337 + fabric.global_rank)
 
@@ -109,7 +189,7 @@ def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path):
 
     # Save the final checkpoint at the end of training
     save_path = out_dir / "lit_model_finetuned.pth"
-    save_checkpoint(fabric, model, save_path)
+    # save_checkpoint(fabric, model, save_path)
 
 
 def train(
@@ -125,7 +205,7 @@ def train(
     tokenizer = Tokenizer(checkpoint_dir)
     max_seq_length, longest_seq_length, longest_seq_ix = get_max_seq_length(train_data)
 
-    validate(fabric, model, val_data, tokenizer, longest_seq_length)  # sanity check
+    # validate(fabric, model, val_data, tokenizer, longest_seq_length)  # sanity check
 
     with torch.device("meta"):
         meta_model = GPT(model.config)
