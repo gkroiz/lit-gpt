@@ -123,6 +123,7 @@ def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path, 
         model = regular_shard(fabric, config, checkpoint_path)
         fabric.print(f'Memory usage after model init (post-shard): {(psutil.virtual_memory()[3]/1e9):.02f} GB')
         
+    mark_only_adapter_as_trainable(model)
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     num_params = sum(p.numel() for p in trainable_params)
     fabric.print(f"Number of trainable parameters: {num_params:,}")
