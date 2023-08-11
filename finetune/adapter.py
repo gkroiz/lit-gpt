@@ -143,8 +143,8 @@ def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path, 
     fabric.print(f"Training time: {(time.time()-train_time):.2f}s")
 
     # Save the final checkpoint at the end of training
-    save_path = out_dir / "lit_model_adapter_finetuned.pth"
-    save_adapter_checkpoint(fabric, model, save_path)
+    # save_path = out_dir / "lit_model_adapter_finetuned.pth"
+    # save_adapter_checkpoint(fabric, model, save_path)
 
 
 def train(
