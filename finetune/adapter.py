@@ -139,8 +139,11 @@ def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path, 
 
     fabric.seed_everything(1337 + fabric.global_rank)
 
+    fabric.print(f'Memory usage before training: {(psutil.virtual_memory()[3]/1e9):.02f} GB')
     train_time = time.time()
     train(fabric, model, optimizer, train_data, val_data, checkpoint_dir, out_dir, speed_monitor)
+    fabric.print(f'Memory usage after training: {(psutil.virtual_memory()[3]/1e9):.02f} GB')
+    
     fabric.print(f"Training time: {(time.time()-train_time):.2f}s")
 
     # Save the final checkpoint at the end of training
@@ -197,10 +200,15 @@ def train(
         is_accumulating = (iter_num + 1) % gradient_accumulation_iters != 0
         with fabric.no_backward_sync(model, enabled=is_accumulating):
             logits = model(input_ids, max_seq_length=max_seq_length, lm_head_chunk_size=128)
+            if fabric.device.type == "xla":
+                xm.mark_step()
             # shift the targets such that output n predicts token n+1
             logits[-1] = logits[-1][..., :-1, :]
             loss = chunked_cross_entropy(logits, targets[..., 1:])
             fabric.backward(loss / gradient_accumulation_iters)
+
+        if fabric.device.type == "xla":
+            xm.mark_step()
 
         if not is_accumulating:
             optimizer.step()
