@@ -33,7 +33,7 @@ override_max_seq_length = None
 learning_rate = 3e-3
 batch_size = 1#64 / devices
 micro_batch_size = 1
-gradient_accumulation_iters = batch_size // micro_batch_size
+gradient_accumulation_iters = 1#batch_size // micro_batch_size
 assert gradient_accumulation_iters > 0
 epoch_size = 50000  # train dataset size
 num_epochs = 5
@@ -334,7 +334,7 @@ def sequential_shard(fabric, config, checkpoint_path, group_gloo):
     with torch.device("meta"):
         model = GPT(config)
     if fabric.global_rank == 0:
-        state_dict = torch.load(checkpoint_path, map_location='cpu')
+        state_dict = torch.load(str(checkpoint_path), map_location='cpu', mmap=True)
     fabric.barrier('wait')
     fabric.print(f'Memory usage after loading checkpoint onto master rank: {(psutil.virtual_memory()[3]/1e9):.02f} GB')
 
@@ -347,8 +347,7 @@ def sequential_shard(fabric, config, checkpoint_path, group_gloo):
         broadcast_param = state_dict[key] if fabric.global_rank == 0 else torch.empty_like(param, dtype=torch.bfloat16, device="cpu")
         broadcast_param = broadcast_param.type(torch.float32)
         dist.broadcast(tensor=broadcast_param, src=0, group=group_gloo)
-        broadcast_param = broadcast_param.type(torch.bfloat16)
-        keys = lm_head_on_device.load_state_dict({param_name: broadcast_param}, strict=False)
+        keys = lm_head_on_device.load_state_dict({param_name: broadcast_param}, strict=False, assign=True)
         assert not keys.unexpected_keys
     model.lm_head = lm_head_on_device
 
@@ -361,8 +360,7 @@ def sequential_shard(fabric, config, checkpoint_path, group_gloo):
         broadcast_param = state_dict[key] if fabric.global_rank == 0 else torch.empty_like(param, dtype=torch.bfloat16, device="cpu")
         broadcast_param = broadcast_param.type(torch.float32)
         dist.broadcast(tensor=broadcast_param, src=0, group=group_gloo)
-        broadcast_param = broadcast_param.type(torch.bfloat16)
-        keys = wte_on_device.load_state_dict({param_name: broadcast_param}, strict=False)
+        keys = wte_on_device.load_state_dict({param_name: broadcast_param}, strict=False, assign=True)
         assert not keys.unexpected_keys
     model.transformer.wte = wte_on_device
 
@@ -376,8 +374,7 @@ def sequential_shard(fabric, config, checkpoint_path, group_gloo):
         broadcast_param = state_dict[key] if fabric.global_rank == 0 else torch.empty_like(param, dtype=torch.bfloat16, device="cpu")
         broadcast_param = broadcast_param.type(torch.float32)
         dist.broadcast(tensor=broadcast_param, src=0, group=group_gloo)
-        broadcast_param = broadcast_param.type(torch.bfloat16)
-        keys = ln_f_on_device.load_state_dict({param_name: broadcast_param}, strict=False)
+        keys = ln_f_on_device.load_state_dict({param_name: broadcast_param}, strict=False, assign=True)
         assert not keys.unexpected_keys
     model.transformer.ln_f = ln_f_on_device
 
@@ -394,8 +391,7 @@ def sequential_shard(fabric, config, checkpoint_path, group_gloo):
                 broadcast_param = state_dict[key] if fabric.global_rank == 0 else torch.empty_like(param, dtype=torch.bfloat16, device="cpu")
             broadcast_param = broadcast_param.type(torch.float32)
             dist.broadcast(tensor=broadcast_param, src=0, group=group_gloo)
-            broadcast_param = broadcast_param.type(torch.bfloat16)
-            keys = block_on_device.load_state_dict({param_name: broadcast_param}, strict=False)
+            keys = block_on_device.load_state_dict({param_name: broadcast_param}, strict=False, assign=True)
             assert not keys.unexpected_keys
         model.transformer.h[i] = XlaFullyShardedDataParallel(checkpoint_module(block_on_device), disable_reshard_on_root=False, compute_dtype=torch.bfloat16)
 
