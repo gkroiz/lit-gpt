@@ -418,6 +418,7 @@ def regular_shard(fabric, config, checkpoint_path):
     mark_only_adapter_as_trainable(model)
 
     model = fabric.setup_module(model)      
+    return model
 
 
 if __name__ == "__main__":
