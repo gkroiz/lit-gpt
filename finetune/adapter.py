@@ -127,7 +127,7 @@ def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path, 
     mark_only_adapter_as_trainable(model)
     trainable_params = [p for p in model.parameters() if p.requires_grad]
 
-    optimizer = torch.optim.AdamW(trainable_params, lr=learning_rate, weight_decay=weight_decay)
+    optimizer = torch.optim.SGD(trainable_params, lr=learning_rate, weight_decay=weight_decay)
 
     if fabric.device.type == "xla":
         optimizer = fabric.setup_optimizers(optimizer)
