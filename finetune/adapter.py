@@ -173,6 +173,7 @@ def train(
         fabric.print(f"Measured TFLOPs: {measured_flops * fabric.world_size / 1e12:.2f}")
         del meta_model, x
 
+    world_size = fabric.world_size
     step_count = 0
     total_lengths = 0
     total_t0 = time.perf_counter()
@@ -220,7 +221,7 @@ def train(
             (iter_num + 1) * micro_batch_size,
             t1 - total_t0,
             # this assumes that device FLOPs are the same and that all devices have the same batch size
-            fabric.world_size,
+            world_size,
             flops_per_batch=measured_flops,
             lengths=total_lengths,
         )
