@@ -3,7 +3,7 @@ import sys
 import time
 from pathlib import Path
 import psutil
-from typing import Optional, List, Dict, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import lightning as L
 import torch
@@ -15,10 +15,11 @@ wd = Path(__file__).parent.parent.resolve()
 sys.path.append(str(wd))
 
 from generate.base import generate
-from lit_gpt.lora import mark_only_lora_as_trainable, lora_filter, GPT, Config, Block, LoRALinear
+from lit_gpt.lora import GPT, Block, Config, lora_filter, mark_only_lora_as_trainable
+from lit_gpt.speed_monitor import SpeedMonitorFabric as SpeedMonitor
+from lit_gpt.speed_monitor import estimate_flops, measure_flops, LoRALinear
 from lit_gpt.tokenizer import Tokenizer
-from lit_gpt.utils import lazy_load, check_valid_checkpoint_dir, step_csv_logger, chunked_cross_entropy
-from lit_gpt.speed_monitor import SpeedMonitorFabric as SpeedMonitor, measure_flops, estimate_flops
+from lit_gpt.utils import check_valid_checkpoint_dir, chunked_cross_entropy, lazy_load, num_parameters, step_csv_logger
 from scripts.prepare_alpaca import generate_prompt
 
 
@@ -71,8 +72,7 @@ def setup(
                 compute_dtype=torch.bfloat16,
             )
         else:
-            precision="bf16-true"
-            strategy=FSDPStrategy(
+            strategy = FSDPStrategy(
                 auto_wrap_policy={Block},
                 activation_checkpointing_policy={Block},
                 state_dict_type="full",
@@ -219,6 +219,10 @@ def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path, 
     if fabric.device.type == "xla":
         model = fabric.setup(model, move_to_device=False)
 
+    fabric.print(f'Memory usage after all model init (before root fsdp sharding): {(psutil.virtual_memory()[3]/1e9):.02f} GB')
+    if fabric.device.type == "xla":
+        model = fabric.setup(model, move_to_device=False)
+
         trainable_params = [p for p in model.parameters() if p.requires_grad]
         num_params = sum(p.numel() for p in trainable_params)
         fabric.print(f"Number of trainable parameters: {num_params:,}")
@@ -288,9 +292,9 @@ def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path, 
                     fabric.barrier('weights_check')
     fabric.seed_everything(1337 + fabric.global_rank)
 
-    train_time = time.time()
+    train_time = time.perf_counter()
     train(fabric, model, optimizer, train_data, val_data, checkpoint_dir, out_dir, speed_monitor)
-    fabric.print(f"Training time: {(time.time()-train_time):.2f}s")
+    fabric.print(f"Training time: {(time.perf_counter()-train_time):.2f}s")
 
     # Save the final LoRA checkpoint at the end of training
     save_path = out_dir / "lit_model_lora_finetuned.pth"
@@ -314,17 +318,17 @@ def train(
 
     with torch.device("meta"):
         meta_model = GPT(model.config)
-        # estimated is too much of an optimistic estimate, left just for reference
-        estimated_flops = estimate_flops(meta_model) * micro_batch_size
-        fabric.print(f"Estimated TFLOPs: {estimated_flops * fabric.world_size / 1e12:.2f}")
-        x = torch.randint(0, 1, (micro_batch_size, model.config.block_size))
+        # estimated flops doesn't account for frozen weights, so it's not reported
+        mark_only_lora_as_trainable(meta_model)
+        # TODO: this assumes that samples have a fixed length which is most likely false during finetuning
+        x = torch.randint(0, 1, (micro_batch_size, longest_seq_length))
         measured_flops = measure_flops(meta_model, x)
         fabric.print(f"Measured TFLOPs: {measured_flops * fabric.world_size / 1e12:.2f}")
         del meta_model, x
 
     step_count = 0
     total_lengths = 0
-    total_t0 = time.time()
+    total_t0 = time.perf_counter()
 
     if fabric.device.type == "xla":
         import torch_xla.core.xla_model as xm
@@ -337,7 +341,7 @@ def train(
             for param_group in optimizer.param_groups:
                 param_group["lr"] = lr
 
-        iter_t0 = time.time()
+        iter_t0 = time.perf_counter()
 
         input_ids, targets = get_batch(
             fabric, train_data, longest_seq_length, longest_seq_ix if iter_num == 0 else None
@@ -358,7 +362,7 @@ def train(
         elif fabric.device.type == "xla":
             xm.mark_step()
 
-        t1 = time.time()
+        t1 = time.perf_counter()
         total_lengths += input_ids.size(1)
         speed_monitor.on_train_batch_end(
             (iter_num + 1) * micro_batch_size,
@@ -375,9 +379,9 @@ def train(
             )
 
         if not is_accumulating and step_count % eval_interval == 0:
-            t0 = time.time()
+            t0 = time.perf_counter()
             val_loss = validate(fabric, model, val_data, tokenizer, longest_seq_length)
-            t1 = time.time() - t0
+            t1 = time.perf_counter() - t0
             speed_monitor.eval_end(t1)
             fabric.print(f"step {iter_num}: val loss {val_loss:.4f}, val time: {t1 * 1000:.2f}ms")
             fabric.barrier()
@@ -405,7 +409,7 @@ def validate(
     fabric.print(instruction)
     sample = {"instruction": instruction, "input": ""}
     prompt = generate_prompt(sample)
-    encoded = tokenizer.encode(prompt, device=model.device)
+    encoded = tokenizer.encode(prompt, device=fabric.device)
     max_returned_tokens = len(encoded) + 100
     output = generate(
         model, idx=encoded, max_returned_tokens=max_returned_tokens, max_seq_length=max_returned_tokens, temperature=0.8
