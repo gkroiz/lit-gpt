@@ -142,6 +142,7 @@ def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path, 
     fabric.print(f'Memory usage after training: {(psutil.virtual_memory()[3]/1e9):.02f} GB')
     
     fabric.print(f"Training time: {(time.perf_counter()-train_time):.2f}s")
+    fabric.print(f'Backup metrics: {speed_monitor.backup_storage}')
 
     # Save the final checkpoint at the end of training
     # save_path = out_dir / "lit_model_adapter_finetuned.pth"
@@ -178,12 +179,14 @@ def train(
         fabric.print(f"Measured TFLOPs: {measured_flops * fabric.world_size / 1e12:.2f}")
         del meta_model, x
 
-    world_size = fabric.world_size
+    
     step_count = 0
     total_lengths = 0
     total_t0 = time.perf_counter()
+    tpu = fabric.device.type == "xla"
+    world_size = fabric.world_size
 
-    if fabric.device.type == "xla":
+    if tpu:
         import torch_xla.core.xla_model as xm
 
         xm.mark_step()
@@ -203,21 +206,21 @@ def train(
         is_accumulating = (iter_num + 1) % gradient_accumulation_iters != 0
         with fabric.no_backward_sync(model, enabled=is_accumulating):
             logits = model(input_ids, max_seq_length=max_seq_length, lm_head_chunk_size=128)
-            if fabric.device.type == "xla":
+            if tpu:
                 xm.mark_step()
             # shift the targets such that output n predicts token n+1
             logits[-1] = logits[-1][..., :-1, :]
             loss = chunked_cross_entropy(logits, targets[..., 1:])
             fabric.backward(loss / gradient_accumulation_iters)
 
-        if fabric.device.type == "xla":
+        if tpu:
             xm.mark_step()
 
         if not is_accumulating:
             optimizer.step()
             optimizer.zero_grad()
             step_count += 1
-        elif fabric.device.type == "xla":
+        elif tpu:
             xm.mark_step()
 
         t1 = time.perf_counter()
@@ -232,8 +235,9 @@ def train(
         )
         if iter_num % log_interval == 0:
             fabric.print(
-                f"iter {iter_num} step {step_count}: loss {loss.item():.4f}, iter time:"
-                f" {(t1 - iter_t0) * 1000:.2f}ms{' (optimizer.step)' if not is_accumulating else ''}"
+                f"iter {iter_num} step {step_count}:"
+                + (f" loss {loss.item():.4f}," if not tpu else "") +
+                f" iter time: {(t1 - iter_t0) * 1000:.2f}ms{' (optimizer.step)' if not is_accumulating else ''}"
             )
 
         if not is_accumulating and step_count % eval_interval == 0:
