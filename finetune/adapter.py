@@ -38,7 +38,7 @@ gradient_accumulation_iters = 1#batch_size // micro_batch_size
 assert gradient_accumulation_iters > 0
 epoch_size = 50000  # train dataset size
 num_epochs = 5
-max_iters = 100#num_epochs * (epoch_size // micro_batch_size) // devices
+max_iters = 200#num_epochs * (epoch_size // micro_batch_size) // devices
 weight_decay = 0.02
 warmup_steps = 2 * (epoch_size // micro_batch_size) // devices // gradient_accumulation_iters  # 2 epochs
 
@@ -137,12 +137,17 @@ def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path, 
     fabric.seed_everything(1337 + fabric.global_rank)
 
     fabric.print(f'Memory usage before training: {(psutil.virtual_memory()[3]/1e9):.02f} GB')
+    backup_storage = {}
     train_time = time.perf_counter()
-    train(fabric, model, optimizer, train_data, val_data, checkpoint_dir, out_dir, speed_monitor)
+    train(fabric, model, optimizer, train_data, val_data, checkpoint_dir, out_dir, speed_monitor, backup_storage)
     fabric.print(f'Memory usage after training: {(psutil.virtual_memory()[3]/1e9):.02f} GB')
     
     fabric.print(f"Training time: {(time.perf_counter()-train_time):.2f}s")
-    fabric.print(f'Backup metrics: {speed_monitor.backup_storage}')
+    
+    if fabric.global_rank == 0:
+        import json
+        with open("backup_metrics.json", "w") as f:
+            json.dump(backup_storage, f, indent=4)
 
     # Save the final checkpoint at the end of training
     # save_path = out_dir / "lit_model_adapter_finetuned.pth"
@@ -158,6 +163,7 @@ def train(
     checkpoint_dir: Path,
     out_dir: Path,
     speed_monitor: SpeedMonitor,
+    backup_storage,
 ) -> None:
     tokenizer = Tokenizer(checkpoint_dir)
     max_seq_length, longest_seq_length, longest_seq_ix = get_max_seq_length(train_data)
@@ -202,7 +208,8 @@ def train(
         input_ids, targets = get_batch(
             fabric, train_data, longest_seq_length, longest_seq_ix if iter_num == 0 else None
         )
-
+        if tpu:
+            xm.mark_step()
         is_accumulating = (iter_num + 1) % gradient_accumulation_iters != 0
         with fabric.no_backward_sync(model, enabled=is_accumulating):
             logits = model(input_ids, max_seq_length=max_seq_length, lm_head_chunk_size=128)
@@ -212,10 +219,8 @@ def train(
             logits[-1] = logits[-1][..., :-1, :]
             loss = chunked_cross_entropy(logits, targets[..., 1:])
             fabric.backward(loss / gradient_accumulation_iters)
-
         if tpu:
             xm.mark_step()
-
         if not is_accumulating:
             optimizer.step()
             optimizer.zero_grad()
@@ -226,6 +231,7 @@ def train(
         t1 = time.perf_counter()
         total_lengths += input_ids.size(1)
         speed_monitor.on_train_batch_end(
+            backup_storage,
             (iter_num + 1) * micro_batch_size,
             t1 - total_t0,
             # this assumes that device FLOPs are the same and that all devices have the same batch size

@@ -214,10 +214,10 @@ class SpeedMonitorBase:
         self.total_eval_wct = 0.0
         self.step = -1
 
-        self.backup_storage = {}
 
     def on_train_batch_end(
         self,
+        backup_storage,
         samples: int,  # total samples seen (per device)
         train_elapsed: float,  # total training time (seconds)
         world_size: int,
@@ -280,7 +280,7 @@ class SpeedMonitorBase:
                 "samples": samples,
             }
         )
-        self.backup_storage[step] = metrics
+        backup_storage[step] = metrics
         self.log_dict(metrics, step)
 
     def eval_end(self, eval_elapsed: float):
