@@ -37,7 +37,7 @@ import utilities.monitor_collectives
 
 utilities.monitor_collectives.shunt_torch_communication()
 
-save_interval = 10000
+save_interval = 1
 eval_interval = 10000
 eval_iters = 100
 log_interval = 1
@@ -284,6 +284,7 @@ def main(
         log_every_n_steps=log_interval,
         val_check_interval=eval_interval,
         num_nodes=num_nodes,
+        deterministic=True,
     )
 
     if debug:
