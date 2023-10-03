@@ -244,7 +244,7 @@ def main(
         strategy = FSDPStrategy(
             auto_wrap_policy={Block},
             activation_checkpointing_policy={Block},
-            state_dict_type="sharded",
+            # state_dict_type="sharded",
             limit_all_gathers=True,
             cpu_offload=False,
             sharding_strategy=ShardingStrategy.FULL_SHARD,
