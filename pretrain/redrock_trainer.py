@@ -37,7 +37,7 @@ import utilities.monitor_collectives
 
 utilities.monitor_collectives.shunt_torch_communication()
 
-save_interval = 10000
+save_interval = 1
 eval_interval = 10000
 eval_iters = 100
 log_interval = 1
@@ -244,8 +244,7 @@ def main(
         strategy = FSDPStrategy(
             auto_wrap_policy={Block},
             activation_checkpointing_policy={Block},
-            # the argument is not available in the Trainer strategy, but it's the default anyways
-            # state_dict_type="full",
+            state_dict_type="sharded",
             limit_all_gathers=True,
             cpu_offload=False,
             sharding_strategy=ShardingStrategy.FULL_SHARD,
