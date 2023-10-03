@@ -267,8 +267,9 @@ def main(
     model_checkpoint = ModelCheckpoint(
         dirpath=checkpoint_out_dir,
         every_n_train_steps=save_interval,
-        save_last=True,
+        save_top_k=-1,
         verbose=True,
+        save_weights_only=True,
     )
     trainer = L.Trainer(
         devices=devices,
