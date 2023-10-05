@@ -1,5 +1,6 @@
 from contextlib import nullcontext
 import math
+import os
 from pathlib import Path
 import sys
 import time
@@ -37,7 +38,7 @@ import utilities.monitor_collectives
 
 utilities.monitor_collectives.shunt_torch_communication()
 
-save_interval = 1
+save_interval = os.environ.get("SAVE_INTERVAL", 10000)
 eval_interval = 10000
 eval_iters = 100
 log_interval = 1
@@ -217,6 +218,7 @@ def main(
     pt_profiler_active: int = 2,
     pt_profiler_repeat: int = 5,
     debug: bool = False,
+    deterministic: bool = False,
 ) -> None:
   if use_pt_profiler:
     cm = nullcontext()
@@ -284,7 +286,7 @@ def main(
         log_every_n_steps=log_interval,
         val_check_interval=eval_interval,
         num_nodes=num_nodes,
-        deterministic=True,
+        deterministic=deterministic,
     )
 
     if debug:
