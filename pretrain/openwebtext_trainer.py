@@ -21,27 +21,27 @@ from lit_gpt.model import GPT, Block
 from lit_gpt.speed_monitor import SpeedMonitorCallback, estimate_flops, measure_flops
 from lit_gpt.utils import chunked_cross_entropy, get_default_supported_precision
 
-model_name = "pythia-70m"
+model_name = "pythia-2.8b"
 name = "openwebtext"
 out_dir = Path("out") / name
-data_dir = Path("data") / name
+data_dir = Path('/data')
 save_interval = 1000
 eval_interval = 1000
-eval_iters = 100
+eval_iters = 50
 log_interval = 1
 
 # Hyperparameters
 learning_rate = 6e-4
-batch_size = 125
-micro_batch_size = 5
+batch_size = 2
+micro_batch_size = 2
 gradient_accumulation_steps = batch_size // micro_batch_size
 assert gradient_accumulation_steps > 0
-max_iters = 600000  # num_epochs * (epoch_size // micro_batch_size) // devices
+max_iters = 100# num_epochs * (epoch_size // micro_batch_size) // devices
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
 decay_lr = True
-warmup_iters = 2000
+warmup_iters = 50#2000
 lr_decay_iters = max_iters
 min_lr = 6e-5
 
@@ -102,7 +102,7 @@ class LightningGPTModule(L.LightningModule):
 
 def main(devices: int = 1, precision: Optional[str] = None) -> None:
     precision = precision or get_default_supported_precision(training=True)
-
+    print('devices: ', devices, flush=True)
     if devices > 1:
         strategy = FSDPStrategy(
             auto_wrap_policy={Block},
@@ -132,6 +132,7 @@ def main(devices: int = 1, precision: Optional[str] = None) -> None:
         accumulate_grad_batches=gradient_accumulation_steps,
         log_every_n_steps=log_interval,
         val_check_interval=eval_interval,
+        num_nodes=4,
     )
 
     L.seed_everything(1337, workers=True)  # same seed for every process to init model (FSDP)
